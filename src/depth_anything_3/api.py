@@ -32,7 +32,7 @@ from depth_anything_3.cfg import create_object, load_config
 from depth_anything_3.registry import MODEL_REGISTRY
 from depth_anything_3.specs import Prediction
 from depth_anything_3.utils.export import export
-from depth_anything_3.utils.geometry import affine_inverse
+from depth_anything_3.utils.geometry import affine_inverse, affine_inverse_np
 from depth_anything_3.utils.io.input_processor import InputProcessor
 from depth_anything_3.utils.io.output_processor import OutputProcessor
 from depth_anything_3.utils.logger import logger
@@ -348,6 +348,42 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
     ) -> Prediction:
         """Align depth map to input extrinsics"""
         if extrinsics is None:
+            # When no extrinsics provided, we need to scale Gaussians to match point cloud
+            # The point cloud uses prediction.extrinsics and prediction.depth as-is
+            # Gaussians might be in a normalized coordinate space, so we compute the scale
+            # from the predicted extrinsics' median distance (similar to normalization)
+            if prediction.gaussians is not None and prediction.extrinsics is not None:
+                # Convert extrinsics to camera-to-world to get camera positions
+                ext_w2c = prediction.extrinsics
+                if ext_w2c.shape[1] == 3:
+                    # Pad to 4x4 if needed
+                    ext_4x4 = np.zeros((ext_w2c.shape[0], 4, 4), dtype=ext_w2c.dtype)
+                    ext_4x4[:, :3, :] = ext_w2c
+                    ext_4x4[:, 3, 3] = 1.0
+                    ext_w2c = ext_4x4
+                
+                c2w = affine_inverse_np(ext_w2c)
+                camera_positions = c2w[:, :3, 3]  # Camera positions in world space
+                
+                # Compute median distance (similar to normalization)
+                distances = np.linalg.norm(camera_positions, axis=1)
+                median_dist = np.median(distances)
+                median_dist = max(median_dist, 1e-1)  # Clamp minimum
+                
+                # If the median distance is significantly different from 1.0,
+                # it suggests normalization was applied. Scale Gaussians accordingly.
+                # The point cloud uses extrinsics as-is, so we scale Gaussians by median_dist
+                # to match the point cloud coordinate space
+                if abs(median_dist - 1.0) > 0.01:  # Only scale if significantly different
+                    scale_factor = median_dist
+                    prediction.gaussians.means = prediction.gaussians.means * scale_factor
+                    prediction.gaussians.scales = prediction.gaussians.scales * scale_factor
+            
+            # Also handle metric scale_factor if it exists (from nested models)
+            if prediction.gaussians is not None and prediction.scale_factor is not None:
+                prediction.gaussians.means = prediction.gaussians.means * prediction.scale_factor
+                prediction.gaussians.scales = prediction.gaussians.scales * prediction.scale_factor
+            
             return prediction
         prediction.intrinsics = intrinsics.numpy()
         _, _, scale, aligned_extrinsics = align_poses_umeyama(
@@ -360,8 +396,27 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         if align_to_input_ext_scale:
             prediction.extrinsics = extrinsics[..., :3, :].numpy()
             prediction.depth /= scale
+            
+            # Scale Gaussians to match the scaled depth and input extrinsics coordinate space
+            if prediction.gaussians is not None:
+                prediction.gaussians.means = prediction.gaussians.means / scale
+                prediction.gaussians.scales = prediction.gaussians.scales / scale
         else:
             prediction.extrinsics = aligned_extrinsics
+            # When align_to_input_ext_scale=False, depth is not scaled but extrinsics are Sim(3) transformed.
+            # To maintain consistency, we scale Gaussians to match the coordinate space.
+            if prediction.gaussians is not None:
+                prediction.gaussians.means = prediction.gaussians.means / scale
+                prediction.gaussians.scales = prediction.gaussians.scales / scale
+        
+        # If there's a metric scale_factor from nested model alignment, apply it to Gaussians
+        # This ensures Gaussians match the metric-scaled depth/extrinsics for metric consistency
+        if prediction.gaussians is not None and prediction.scale_factor is not None:
+            # The scale_factor was already applied to depth/extrinsics in _apply_depth_alignment
+            # So we need to apply it to Gaussians too to keep them in the same coordinate space
+            prediction.gaussians.means = prediction.gaussians.means * prediction.scale_factor
+            prediction.gaussians.scales = prediction.gaussians.scales * prediction.scale_factor
+        
         return prediction
 
     def _run_model_forward(
