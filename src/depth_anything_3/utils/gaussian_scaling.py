@@ -15,6 +15,7 @@ class GaussianScalingMethod(str, Enum):
     UMEYAMA_CAMERAS = "umeyama_cameras"
     MEDIAN_DISTANCE = "median_distance"
     INVERSE_NORMALIZATION = "inverse_normalization"
+    BBOX_SCALING = "bbox_scaling"
 
 
 def umeyama_points(
@@ -341,6 +342,67 @@ def inverse_normalization_transform(
     return R, t, scale
 
 
+def bbox_scaling(
+    gaussian_points: np.ndarray,  # (M, 3) - Gaussian means
+    point_cloud_points: np.ndarray,  # (N, 3) - Point cloud points
+    percentile: float = 95.0,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Compute scale factor using bounding box comparison with outlier rejection.
+    
+    Calculates bounding boxes for both point clouds using percentile-based
+    bounds (e.g., 95%) to avoid outliers, then computes scale from the ratio
+    of bbox sizes.
+    
+    Args:
+        gaussian_points: Gaussian means (M, 3)
+        point_cloud_points: Point cloud points (N, 3)
+        percentile: Percentile to use for bbox calculation (default: 95.0)
+                    Uses (100-percentile)/2 and (100+percentile)/2 as bounds
+        
+    Returns:
+        Rotation (3, 3), translation (3,), scale (float)
+    """
+    if gaussian_points.shape[0] < 3 or point_cloud_points.shape[0] < 3:
+        raise ValueError("Need at least 3 points for bbox scaling")
+    
+    # Compute percentile bounds (e.g., for 95%: use 2.5% and 97.5%)
+    lower_percentile = (100.0 - percentile) / 2.0
+    upper_percentile = 100.0 - lower_percentile
+    
+    # Compute bbox for Gaussian points
+    gaussian_min = np.percentile(gaussian_points, lower_percentile, axis=0)  # (3,)
+    gaussian_max = np.percentile(gaussian_points, upper_percentile, axis=0)  # (3,)
+    gaussian_size = gaussian_max - gaussian_min  # (3,)
+    gaussian_diagonal = np.linalg.norm(gaussian_size)  # scalar
+    
+    # Compute bbox for point cloud points
+    pc_min = np.percentile(point_cloud_points, lower_percentile, axis=0)  # (3,)
+    pc_max = np.percentile(point_cloud_points, upper_percentile, axis=0)  # (3,)
+    pc_size = pc_max - pc_min  # (3,)
+    pc_diagonal = np.linalg.norm(pc_size)  # scalar
+    
+    # Compute scale from ratio of diagonals
+    if gaussian_diagonal < 1e-6:
+        raise ValueError("Gaussian bbox is too small, cannot compute scale")
+    
+    scale = pc_diagonal / gaussian_diagonal
+    
+    # Compute translation to align centers
+    gaussian_center = (gaussian_min + gaussian_max) / 2.0  # (3,)
+    pc_center = (pc_min + pc_max) / 2.0  # (3,)
+    
+    # Translation: align centers after scaling
+    # We want: scale * gaussian_center + t = pc_center
+    # So: t = pc_center - scale * gaussian_center
+    t = pc_center - scale * gaussian_center
+    
+    # Rotation: identity (bbox scaling doesn't account for rotation)
+    R = np.eye(3)
+    
+    return R, t, scale
+
+
 def sample_points_from_depth(
     depth: np.ndarray,
     intrinsics: np.ndarray,
@@ -469,6 +531,15 @@ def align_gaussians(
     elif method == GaussianScalingMethod.INVERSE_NORMALIZATION:
         return inverse_normalization_transform(extrinsics)
     
+    elif method == GaussianScalingMethod.BBOX_SCALING:
+        if point_cloud_points is None:
+            raise ValueError("point_cloud_points required for bbox_scaling method")
+        return bbox_scaling(
+            gaussian_points,
+            point_cloud_points,
+            percentile=kwargs.get("percentile", 95.0),
+        )
+    
     else:
         raise ValueError(f"Unknown scaling method: {method}")
 
@@ -571,6 +642,28 @@ def align_gaussians_to_point_cloud(
                 method=method,
                 gaussian_points=gaussian_points,
                 extrinsics=prediction.extrinsics,
+            )
+        
+        elif method == GaussianScalingMethod.BBOX_SCALING:
+            # Sample corresponding points from point cloud
+            point_cloud_points = sample_points_from_depth(
+                prediction.depth,
+                prediction.intrinsics,
+                prediction.extrinsics,
+                prediction.conf,
+                max_samples=10000,
+            )
+            
+            if point_cloud_points.shape[0] < 3 or gaussian_points.shape[0] < 3:
+                logger.warning("Not enough points for bbox scaling. Skipping.")
+                return prediction
+            
+            rot, trans, scale = align_gaussians(
+                method=method,
+                gaussian_points=gaussian_points,
+                extrinsics=prediction.extrinsics,
+                point_cloud_points=point_cloud_points,
+                percentile=95.0,  # Hardcoded for now
             )
         
         else:
