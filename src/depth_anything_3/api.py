@@ -396,26 +396,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         if align_to_input_ext_scale:
             prediction.extrinsics = extrinsics[..., :3, :].numpy()
             prediction.depth /= scale
-            
-            # Scale Gaussians to match the scaled depth and input extrinsics coordinate space
-            if prediction.gaussians is not None:
-                prediction.gaussians.means = prediction.gaussians.means / scale
-                prediction.gaussians.scales = prediction.gaussians.scales / scale
         else:
             prediction.extrinsics = aligned_extrinsics
-            # When align_to_input_ext_scale=False, depth is not scaled but extrinsics are Sim(3) transformed.
-            # To maintain consistency, we scale Gaussians to match the coordinate space.
-            if prediction.gaussians is not None:
-                prediction.gaussians.means = prediction.gaussians.means / scale
-                prediction.gaussians.scales = prediction.gaussians.scales / scale
-        
-        # If there's a metric scale_factor from nested model alignment, apply it to Gaussians
-        # This ensures Gaussians match the metric-scaled depth/extrinsics for metric consistency
-        if prediction.gaussians is not None and prediction.scale_factor is not None:
-            # The scale_factor was already applied to depth/extrinsics in _apply_depth_alignment
-            # So we need to apply it to Gaussians too to keep them in the same coordinate space
-            prediction.gaussians.means = prediction.gaussians.means * prediction.scale_factor
-            prediction.gaussians.scales = prediction.gaussians.scales * prediction.scale_factor
         
         return prediction
 
