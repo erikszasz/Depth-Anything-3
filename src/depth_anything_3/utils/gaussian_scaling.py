@@ -3,6 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 import numpy as np
+import torch
 
 from depth_anything_3.specs import Prediction
 from depth_anything_3.utils.geometry import affine_inverse_np
@@ -579,7 +580,15 @@ def align_gaussians_to_point_cloud(
     if isinstance(method, str):
         method = GaussianScalingMethod(method)
     
+    # Convert tensors to numpy if needed
     gaussian_points = prediction.gaussians.means  # (N, 3)
+    if isinstance(gaussian_points, torch.Tensor):
+        gaussian_points = gaussian_points.detach().cpu().numpy()
+    
+    # Ensure extrinsics are numpy arrays
+    extrinsics_np = prediction.extrinsics
+    if isinstance(extrinsics_np, torch.Tensor):
+        extrinsics_np = extrinsics_np.detach().cpu().numpy()
     
     try:
         if method == GaussianScalingMethod.UMEYAMA_POINTS:
@@ -587,13 +596,13 @@ def align_gaussians_to_point_cloud(
             point_cloud_points = sample_points_from_depth(
                 prediction.depth,
                 prediction.intrinsics,
-                prediction.extrinsics,
+                extrinsics_np,
                 prediction.conf,
                 max_samples=max_samples,
             )
             
             if point_cloud_points.shape[0] < 3 or gaussian_points.shape[0] < 3:
-                logger.warn("Not enough points for alignment. Skipping.")
+                logger.warning("Not enough points for alignment. Skipping.")
                 return prediction
             
             # Sample a subset for faster alignment if we have too many points
@@ -613,7 +622,7 @@ def align_gaussians_to_point_cloud(
             rot, trans, scale = align_gaussians(
                 method=method,
                 gaussian_points=gaussian_samples,
-                extrinsics=prediction.extrinsics,
+                extrinsics=extrinsics_np,
                 point_cloud_points=point_cloud_samples,
                 ransac=ransac,
                 ransac_max_iters=ransac_max_iters,
@@ -624,7 +633,7 @@ def align_gaussians_to_point_cloud(
             rot, trans, scale = align_gaussians(
                 method=method,
                 gaussian_points=gaussian_points,
-                extrinsics=prediction.extrinsics,
+                extrinsics=extrinsics_np,
                 ransac=ransac,
                 ransac_max_iters=ransac_max_iters,
                 random_state=random_state,
@@ -634,14 +643,14 @@ def align_gaussians_to_point_cloud(
             rot, trans, scale = align_gaussians(
                 method=method,
                 gaussian_points=gaussian_points,
-                extrinsics=prediction.extrinsics,
+                extrinsics=extrinsics_np,
             )
         
         elif method == GaussianScalingMethod.INVERSE_NORMALIZATION:
             rot, trans, scale = align_gaussians(
                 method=method,
                 gaussian_points=gaussian_points,
-                extrinsics=prediction.extrinsics,
+                extrinsics=extrinsics_np,
             )
         
         elif method == GaussianScalingMethod.BBOX_SCALING:
@@ -649,19 +658,19 @@ def align_gaussians_to_point_cloud(
             point_cloud_points = sample_points_from_depth(
                 prediction.depth,
                 prediction.intrinsics,
-                prediction.extrinsics,
+                extrinsics_np,
                 prediction.conf,
                 max_samples=10000,
             )
             
             if point_cloud_points.shape[0] < 3 or gaussian_points.shape[0] < 3:
-                logger.warn("Not enough points for bbox scaling. Skipping.")
+                logger.warning("Not enough points for bbox scaling. Skipping.")
                 return prediction
             
             rot, trans, scale = align_gaussians(
                 method=method,
                 gaussian_points=gaussian_points,
-                extrinsics=prediction.extrinsics,
+                extrinsics=extrinsics_np,
                 point_cloud_points=point_cloud_points,
                 percentile=95.0,  # Hardcoded for now
             )
@@ -670,9 +679,19 @@ def align_gaussians_to_point_cloud(
             raise ValueError(f"Unknown scaling method: {method}")
         
         # Apply transformation to all Gaussian points
-        prediction.gaussians.means = transform_points_sim3(
-            prediction.gaussians.means, rot, trans, scale, inverse=False
+        # Convert back to tensor if original was tensor
+        gaussian_means_np = transform_points_sim3(
+            gaussian_points, rot, trans, scale, inverse=False
         )
+        
+        # Convert back to tensor if original was tensor
+        if isinstance(prediction.gaussians.means, torch.Tensor):
+            prediction.gaussians.means = torch.from_numpy(gaussian_means_np).to(
+                prediction.gaussians.means.device
+            )
+        else:
+            prediction.gaussians.means = gaussian_means_np
+        
         # Also scale the Gaussian scales
         prediction.gaussians.scales = prediction.gaussians.scales * scale
         
