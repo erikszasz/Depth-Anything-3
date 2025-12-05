@@ -401,7 +401,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         """Align depth map to input extrinsics"""
         if extrinsics is None:
             if prediction.gaussians is None or prediction.extrinsics is None:
-                return
+                return prediction
 
             align_gaussians_to_point_cloud(prediction, method=gaussian_scaling_method)
             return prediction
