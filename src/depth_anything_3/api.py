@@ -37,7 +37,12 @@ from depth_anything_3.utils.geometry import affine_inverse, affine_inverse_np
 from depth_anything_3.utils.io.input_processor import InputProcessor
 from depth_anything_3.utils.io.output_processor import OutputProcessor
 from depth_anything_3.utils.logger import logger
-from depth_anything_3.utils.pose_align import align_poses_umeyama
+from depth_anything_3.utils.pose_align import align_poses_umeyama, transform_points_sim3
+from depth_anything_3.utils.gaussian_scaling import (
+    GaussianScalingMethod,
+    align_gaussians_to_point_cloud,
+)
+from depth_anything_3.utils.extrinsics import normalize_extrinsics
 
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
@@ -191,6 +196,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         feat_vis_fps: int = 15,
         # Other export parameters, e.g., gs_ply, gs_video
         export_kwargs: Optional[dict] = {},
+        # Gaussian scaling method
+        gaussian_scaling_method: GaussianScalingMethod | str = GaussianScalingMethod.UMEYAMA_POINTS,
     ) -> Prediction:
         """
         Run inference on input images.
@@ -249,9 +256,14 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         # Convert raw output to prediction
         prediction = self._convert_to_prediction(raw_output)
 
+        # Convert scaling method string to enum if needed
+        if isinstance(gaussian_scaling_method, str):
+            gaussian_scaling_method = GaussianScalingMethod(gaussian_scaling_method)
+        
         # Align prediction to extrinsincs
         prediction = self._align_to_input_extrinsics_intrinsics(
-            extrinsics, intrinsics, prediction, align_to_input_ext_scale
+            extrinsics, intrinsics, prediction, align_to_input_ext_scale,
+            gaussian_scaling_method=gaussian_scaling_method
         )
 
         # Add processed images for visualization
@@ -375,17 +387,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
     def _normalize_extrinsics(self, ex_t: torch.Tensor | None) -> torch.Tensor | None:
         """Normalize extrinsics"""
-        if ex_t is None:
-            return None
-        transform = affine_inverse(ex_t[:, :1])
-        ex_t_norm = ex_t @ transform
-        c2ws = affine_inverse(ex_t_norm)
-        translations = c2ws[..., :3, 3]
-        dists = translations.norm(dim=-1)
-        median_dist = torch.median(dists)
-        median_dist = torch.clamp(median_dist, min=1e-1)
-        ex_t_norm[..., :3, 3] = ex_t_norm[..., :3, 3] / median_dist
-        return ex_t_norm
+        return normalize_extrinsics(ex_t)
 
     def _align_to_input_extrinsics_intrinsics(
         self,
@@ -394,46 +396,16 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         prediction: Prediction,
         align_to_input_ext_scale: bool = True,
         ransac_view_thresh: int = 10,
+        gaussian_scaling_method: GaussianScalingMethod = GaussianScalingMethod.UMEYAMA_POINTS,
     ) -> Prediction:
         """Align depth map to input extrinsics"""
         if extrinsics is None:
-            # When no extrinsics provided, we need to scale Gaussians to match point cloud
-            # The point cloud uses prediction.extrinsics and prediction.depth as-is
-            # Gaussians might be in a normalized coordinate space, so we compute the scale
-            # from the predicted extrinsics' median distance (similar to normalization)
-            if prediction.gaussians is not None and prediction.extrinsics is not None:
-                # Convert extrinsics to camera-to-world to get camera positions
-                ext_w2c = prediction.extrinsics
-                if ext_w2c.shape[1] == 3:
-                    # Pad to 4x4 if needed
-                    ext_4x4 = np.zeros((ext_w2c.shape[0], 4, 4), dtype=ext_w2c.dtype)
-                    ext_4x4[:, :3, :] = ext_w2c
-                    ext_4x4[:, 3, 3] = 1.0
-                    ext_w2c = ext_4x4
-                
-                c2w = affine_inverse_np(ext_w2c)
-                camera_positions = c2w[:, :3, 3]  # Camera positions in world space
-                
-                # Compute median distance (similar to normalization)
-                distances = np.linalg.norm(camera_positions, axis=1)
-                median_dist = np.median(distances)
-                median_dist = max(median_dist, 1e-1)  # Clamp minimum
-                
-                # If the median distance is significantly different from 1.0,
-                # it suggests normalization was applied. Scale Gaussians accordingly.
-                # The point cloud uses extrinsics as-is, so we scale Gaussians by median_dist
-                # to match the point cloud coordinate space
-                if abs(median_dist - 1.0) > 0.01:  # Only scale if significantly different
-                    scale_factor = median_dist
-                    prediction.gaussians.means = prediction.gaussians.means * scale_factor
-                    prediction.gaussians.scales = prediction.gaussians.scales * scale_factor
-            
-            # Also handle metric scale_factor if it exists (from nested models)
-            if prediction.gaussians is not None and prediction.scale_factor is not None:
-                prediction.gaussians.means = prediction.gaussians.means * prediction.scale_factor
-                prediction.gaussians.scales = prediction.gaussians.scales * prediction.scale_factor
-            
+            if prediction.gaussians is None or prediction.extrinsics is None:
+                return
+
+            align_gaussians_to_point_cloud(prediction, method=gaussian_scaling_method)
             return prediction
+
         prediction.intrinsics = intrinsics.numpy()
         _, _, scale, aligned_extrinsics = align_poses_umeyama(
             prediction.extrinsics,
@@ -496,6 +468,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         prediction.processed_images = processed_imgs
         return prediction
+
+    
 
     def _export_results(
         self, prediction: Prediction, export_format: str, export_dir: str, **kwargs
