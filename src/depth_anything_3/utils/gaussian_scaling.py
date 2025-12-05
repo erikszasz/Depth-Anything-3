@@ -14,6 +14,7 @@ class GaussianScalingMethod(str, Enum):
     UMEYAMA_POINTS = "umeyama_points"
     UMEYAMA_CAMERAS = "umeyama_cameras"
     MEDIAN_DISTANCE = "median_distance"
+    INVERSE_NORMALIZATION = "inverse_normalization"
 
 
 def umeyama_points(
@@ -284,6 +285,62 @@ def median_distance_scaling(
     return median_dist
 
 
+def inverse_normalization_transform(
+    extrinsics: np.ndarray,  # (N, 3, 4) or (N, 4, 4) - w2c extrinsics (normalized space)
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Compute the inverse of the normalization transformation.
+    
+    The normalization process:
+    1. Transforms to first camera frame: ex_t_norm = ex_t @ affine_inverse(ex_t[:, :1])
+    2. Scales by median distance: ex_t_norm[..., :3, 3] /= median_dist
+    
+    This function computes the inverse transformation to bring points from
+    normalized space back to the original coordinate space.
+    
+    Args:
+        extrinsics: Normalized camera extrinsics w2c (N, 3, 4) or (N, 4, 4)
+        
+    Returns:
+        Rotation (3, 3), translation (3,), scale (float) - inverse normalization transform
+    """
+    # Convert extrinsics to 4x4 if needed
+    if extrinsics.shape[1] == 3:
+        ext_4x4 = np.zeros((extrinsics.shape[0], 4, 4), dtype=extrinsics.dtype)
+        ext_4x4[:, :3, :] = extrinsics
+        ext_4x4[:, 3, 3] = 1.0
+        extrinsics = ext_4x4
+    
+    # Convert to camera-to-world to get camera positions
+    c2w_norm = affine_inverse_np(extrinsics)
+    camera_positions_norm = c2w_norm[:, :3, 3]  # (N, 3) - in normalized space
+    
+    # Compute median distance (scale factor that was applied during normalization)
+    distances = np.linalg.norm(camera_positions_norm, axis=1)
+    median_dist = np.median(distances)
+    median_dist = max(median_dist, 1e-1)  # Clamp minimum
+    
+    # The normalization transformation:
+    # 1. Frame transform: maps first camera to origin (T_frame)
+    # 2. Scale: divides by median_dist (T_scale)
+    # Combined: T_norm = T_frame @ T_scale
+    
+    # The inverse transformation:
+    # 1. Scale: multiply by median_dist (inverse of division)
+    # 2. Frame transform inverse: maps origin back to first camera position
+    
+    # In normalized space, first camera is at origin (or very close)
+    first_cam_pos_norm = camera_positions_norm[0]
+    
+    # Simplified approach: normalization preserves relative orientations,
+    # so rotation is identity. Translation accounts for first camera position.
+    R = np.eye(3)  # Identity rotation (normalization preserves relative orientations)
+    t = first_cam_pos_norm * median_dist  # Translation (should be close to zero)
+    scale = median_dist  # Scale factor
+    
+    return R, t, scale
+
+
 def sample_points_from_depth(
     depth: np.ndarray,
     intrinsics: np.ndarray,
@@ -409,6 +466,9 @@ def align_gaussians(
         # Return identity rotation and zero translation, only scale
         return np.eye(3), np.zeros(3), scale
     
+    elif method == GaussianScalingMethod.INVERSE_NORMALIZATION:
+        return inverse_normalization_transform(extrinsics)
+    
     else:
         raise ValueError(f"Unknown scaling method: {method}")
 
@@ -500,6 +560,13 @@ def align_gaussians_to_point_cloud(
             )
         
         elif method == GaussianScalingMethod.MEDIAN_DISTANCE:
+            rot, trans, scale = align_gaussians(
+                method=method,
+                gaussian_points=gaussian_points,
+                extrinsics=prediction.extrinsics,
+            )
+        
+        elif method == GaussianScalingMethod.INVERSE_NORMALIZATION:
             rot, trans, scale = align_gaussians(
                 method=method,
                 gaussian_points=gaussian_points,
