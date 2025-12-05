@@ -572,7 +572,7 @@ def align_gaussians_to_point_cloud(
         Prediction with aligned Gaussians (modified in-place)
     """
     if prediction.gaussians is None or prediction.extrinsics is None:
-        logger.warning("Cannot align Gaussians: missing gaussians or extrinsics")
+        logger.warn("Cannot align Gaussians: missing gaussians or extrinsics")
         return prediction
     
     # Convert method string to enum if needed
@@ -593,7 +593,7 @@ def align_gaussians_to_point_cloud(
             )
             
             if point_cloud_points.shape[0] < 3 or gaussian_points.shape[0] < 3:
-                logger.warning("Not enough points for alignment. Skipping.")
+                logger.warn("Not enough points for alignment. Skipping.")
                 return prediction
             
             # Sample a subset for faster alignment if we have too many points
@@ -655,7 +655,7 @@ def align_gaussians_to_point_cloud(
             )
             
             if point_cloud_points.shape[0] < 3 or gaussian_points.shape[0] < 3:
-                logger.warning("Not enough points for bbox scaling. Skipping.")
+                logger.warn("Not enough points for bbox scaling. Skipping.")
                 return prediction
             
             rot, trans, scale = align_gaussians(
@@ -681,7 +681,7 @@ def align_gaussians_to_point_cloud(
             f"scale={scale:.4f}, translation norm={np.linalg.norm(trans):.4f}"
         )
     except Exception as e:
-        logger.warning(f"Failed to align Gaussians using {method.value}: {e}. Skipping alignment.")
+        logger.warn(f"Failed to align Gaussians using {method.value}: {e}. Skipping alignment.")
     
     return prediction
 
