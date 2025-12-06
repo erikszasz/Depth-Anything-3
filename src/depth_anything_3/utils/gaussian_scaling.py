@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
 import numpy as np
 import torch
 
 from depth_anything_3.specs import Prediction
 from depth_anything_3.utils.geometry import affine_inverse_np
-from depth_anything_3.utils.pose_align import align_poses_umeyama, transform_points_sim3
+from depth_anything_3.utils.pose_align import transform_points_sim3
 from depth_anything_3.utils.logger import logger
 
 
@@ -55,6 +54,24 @@ def _reshape_points_back(points: np.ndarray, original_shape: tuple) -> np.ndarra
         return points.reshape(original_shape)
     else:
         raise ValueError(f"Unexpected original shape: {original_shape}")
+
+
+def _extrinsics_to_4x4(extrinsics: np.ndarray) -> np.ndarray:
+    """
+    Convert extrinsics to 4x4 format if needed.
+    
+    Args:
+        extrinsics: Camera extrinsics w2c (N, 3, 4) or (N, 4, 4)
+        
+    Returns:
+        Extrinsics in 4x4 format (N, 4, 4)
+    """
+    if extrinsics.shape[1] == 3:
+        ext_4x4 = np.zeros((extrinsics.shape[0], 4, 4), dtype=extrinsics.dtype)
+        ext_4x4[:, :3, :] = extrinsics
+        ext_4x4[:, 3, 3] = 1.0
+        return ext_4x4
+    return extrinsics
 
 
 def umeyama_points(
@@ -223,12 +240,7 @@ def median_distance_scaling(
     Returns:
         Scale factor (float)
     """
-    # Convert extrinsics to 4x4 if needed
-    if extrinsics.shape[1] == 3:
-        ext_4x4 = np.zeros((extrinsics.shape[0], 4, 4), dtype=extrinsics.dtype)
-        ext_4x4[:, :3, :] = extrinsics
-        ext_4x4[:, 3, 3] = 1.0
-        extrinsics = ext_4x4
+    extrinsics = _extrinsics_to_4x4(extrinsics)
     
     # Extract camera positions
     c2w = affine_inverse_np(extrinsics)
@@ -237,9 +249,7 @@ def median_distance_scaling(
     # Compute median distance
     distances = np.linalg.norm(camera_positions, axis=1)
     median_dist = np.median(distances)
-    median_dist = max(median_dist, 1e-1)  # Clamp minimum
-    
-    return median_dist
+    return max(median_dist, 1e-1)  # Clamp minimum
 
 
 def filter_points_by_percentile(
@@ -408,9 +418,7 @@ def sample_points_from_depth(
             ext_4x4 = np.eye(4, dtype=ext_w2c.dtype)
             ext_4x4[:3, :] = ext_w2c
             ext_w2c = ext_4x4
-        elif ext_w2c.shape == (4, 4):
-            pass
-        else:
+        elif ext_w2c.shape != (4, 4):
             continue
         
         c2w = np.linalg.inv(ext_w2c)  # (4, 4)
@@ -619,10 +627,13 @@ def align_gaussians_to_point_cloud(
         else:
             prediction.gaussians.means = gaussian_means_np
         
-        # Also scale the Gaussian scales
-        # Convert scale to appropriate type (torch.Tensor if scales is tensor, else numpy)
+        # Scale the Gaussian scales
         if isinstance(prediction.gaussians.scales, torch.Tensor):
-            scale_tensor = torch.tensor(scale, dtype=prediction.gaussians.scales.dtype, device=prediction.gaussians.scales.device)
+            scale_tensor = torch.tensor(
+                scale,
+                dtype=prediction.gaussians.scales.dtype,
+                device=prediction.gaussians.scales.device,
+            )
             prediction.gaussians.scales = prediction.gaussians.scales * scale_tensor
         else:
             prediction.gaussians.scales = prediction.gaussians.scales * scale
