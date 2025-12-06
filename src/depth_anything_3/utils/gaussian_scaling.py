@@ -13,10 +13,49 @@ from depth_anything_3.utils.logger import logger
 
 class GaussianScalingMethod(str, Enum):
     UMEYAMA_POINTS = "umeyama_points"
-    UMEYAMA_CAMERAS = "umeyama_cameras"
     MEDIAN_DISTANCE = "median_distance"
     INVERSE_NORMALIZATION = "inverse_normalization"
     BBOX_SCALING = "bbox_scaling"
+
+
+def _reshape_points_to_2d(points: np.ndarray) -> tuple[np.ndarray, tuple]:
+    """
+    Reshape points array to 2D (N, 3) format, handling batch dimensions.
+    
+    Args:
+        points: Points array with shape (N, 3), (B, N, 3), or (B, N, D)
+        
+    Returns:
+        Reshaped points (M, 3) and original shape for reshaping back
+    """
+    original_shape = points.shape
+    if len(points.shape) == 2:
+        # Already (N, 3)
+        return points, original_shape
+    elif len(points.shape) == 3:
+        # (B, N, 3) -> (B*N, 3)
+        return points.reshape(-1, points.shape[-1]), original_shape
+    else:
+        raise ValueError(f"Unexpected points shape: {points.shape}, expected (N, 3) or (B, N, 3)")
+
+
+def _reshape_points_back(points: np.ndarray, original_shape: tuple) -> np.ndarray:
+    """
+    Reshape points back to original shape.
+    
+    Args:
+        points: Points array (M, 3)
+        original_shape: Original shape tuple
+        
+    Returns:
+        Reshaped points with original_shape
+    """
+    if len(original_shape) == 2:
+        return points
+    elif len(original_shape) == 3:
+        return points.reshape(original_shape)
+    else:
+        raise ValueError(f"Unexpected original shape: {original_shape}")
 
 
 def umeyama_points(
@@ -173,89 +212,6 @@ def umeyama_points(
     return r, t, s
 
 
-def umeyama_cameras(
-    extrinsics: np.ndarray,  # (N, 3, 4) or (N, 4, 4) - w2c extrinsics
-    gaussian_points: np.ndarray,  # (M, 3) - Gaussian means
-    ransac: bool = True,
-    ransac_max_iters: int = 50,
-    random_state: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Align Gaussians using Umeyama alignment on camera positions.
-    
-    Extracts camera positions from extrinsics and finds corresponding positions
-    in Gaussian space, then uses Umeyama alignment to compute the transformation.
-    
-    Args:
-        extrinsics: Camera extrinsics w2c (N, 3, 4) or (N, 4, 4)
-        gaussian_points: Gaussian means (M, 3)
-        ransac: Whether to use RANSAC for robust alignment
-        ransac_max_iters: Maximum RANSAC iterations
-        random_state: Random seed for RANSAC
-        
-    Returns:
-        Rotation (3, 3), translation (3,), scale (float)
-    """
-    # Convert extrinsics to 4x4 if needed
-    if extrinsics.shape[1] == 3:
-        ext_4x4 = np.zeros((extrinsics.shape[0], 4, 4), dtype=extrinsics.dtype)
-        ext_4x4[:, :3, :] = extrinsics
-        ext_4x4[:, 3, 3] = 1.0
-        extrinsics = ext_4x4
-    
-    # Extract camera positions (camera-to-world, then translation)
-    c2w = affine_inverse_np(extrinsics)
-    camera_positions_pc = c2w[:, :3, 3]  # (N, 3) - camera positions for point cloud
-    
-    # Find corresponding camera positions in Gaussian space
-    # For each camera position, find the nearest Gaussian point
-    camera_positions_gs = []
-    for cam_pos_pc in camera_positions_pc:
-        # Find nearest Gaussian point to this camera position
-        distances = np.linalg.norm(gaussian_points - cam_pos_pc[None, :], axis=1)
-        nearest_idx = distances.argmin()
-        camera_positions_gs.append(gaussian_points[nearest_idx])
-    
-    camera_positions_gs = np.array(camera_positions_gs)
-    
-    if camera_positions_gs.shape[0] < 3:
-        raise ValueError(f"Need at least 3 camera positions, got {camera_positions_gs.shape[0]}")
-    
-    # Use Umeyama alignment on camera positions
-    # Convert to extrinsics format for align_poses_umeyama
-    # Create dummy extrinsics from camera positions
-    n_cams = camera_positions_gs.shape[0]
-    
-    # Create identity rotations for dummy extrinsics
-    R_identity = np.eye(3)
-    
-    # Create poses: identity rotation, camera positions as translations
-    poses_pc = np.zeros((n_cams, 4, 4))
-    poses_pc[:, :3, :3] = R_identity
-    poses_pc[:, :3, 3] = camera_positions_pc
-    poses_pc[:, 3, 3] = 1.0
-    
-    poses_gs = np.zeros((n_cams, 4, 4))
-    poses_gs[:, :3, :3] = R_identity
-    poses_gs[:, :3, 3] = camera_positions_gs
-    poses_gs[:, 3, 3] = 1.0
-    
-    # Convert to extrinsics (w2c)
-    ext_pc = affine_inverse_np(poses_pc)
-    ext_gs = affine_inverse_np(poses_gs)
-    
-    # Use Umeyama alignment
-    r, t, s = align_poses_umeyama(
-        ext_pc,  # Reference (point cloud camera positions)
-        ext_gs,  # Estimated (Gaussian space camera positions)
-        ransac=ransac,
-        ransac_max_iters=ransac_max_iters,
-        random_state=random_state,
-    )
-    
-    return r, t, s
-
-
 def median_distance_scaling(
     extrinsics: np.ndarray,  # (N, 3, 4) or (N, 4, 4) - w2c extrinsics
 ) -> float:
@@ -343,6 +299,37 @@ def inverse_normalization_transform(
     return R, t, scale
 
 
+def filter_points_by_percentile(
+    points: np.ndarray,
+    percentile_low: float,
+    percentile_high: float,
+) -> np.ndarray:
+    """
+    Filter points by removing those outside the percentile range in each dimension.
+    
+    Args:
+        points: Point cloud (N, 3)
+        percentile_low: Lower percentile threshold (e.g., 5.0)
+        percentile_high: Upper percentile threshold (e.g., 95.0)
+        
+    Returns:
+        Filtered points (M, 3) where M <= N
+    """
+    filtered_points = points.copy()
+    
+    for dim in range(3):  # x, y, z dimensions
+        # Use filtered_points (not original points) to get values for current dimension
+        values = filtered_points[:, dim]
+        low_threshold = np.percentile(values, percentile_low)
+        high_threshold = np.percentile(values, percentile_high)
+        
+        # Keep points within percentile range for this dimension
+        mask = (values >= low_threshold) & (values <= high_threshold)
+        filtered_points = filtered_points[mask]
+    
+    return filtered_points
+
+
 def bbox_scaling(
     gaussian_points: np.ndarray,  # (M, 3) - Gaussian means
     point_cloud_points: np.ndarray,  # (N, 3) - Point cloud points
@@ -351,15 +338,16 @@ def bbox_scaling(
     """
     Compute scale factor using bounding box comparison with outlier rejection.
     
-    Calculates bounding boxes for both point clouds using percentile-based
-    bounds (e.g., 95%) to avoid outliers, then computes scale from the ratio
-    of bbox sizes.
+    Filters points by removing outliers using percentile-based filtering in each
+    dimension, then computes bounding boxes on the filtered points and derives
+    scale from the ratio of bbox diagonals.
     
     Args:
         gaussian_points: Gaussian means (M, 3)
         point_cloud_points: Point cloud points (N, 3)
-        percentile: Percentile to use for bbox calculation (default: 95.0)
-                    Uses (100-percentile)/2 and (100+percentile)/2 as bounds
+        percentile: Percentile to use for filtering (default: 95.0)
+                   Uses (100-percentile)/2 and (100+percentile)/2 as bounds
+                   (e.g., 95% -> 5% and 95%)
         
     Returns:
         Rotation (3, 3), translation (3,), scale (float)
@@ -367,19 +355,39 @@ def bbox_scaling(
     if gaussian_points.shape[0] < 3 or point_cloud_points.shape[0] < 3:
         raise ValueError("Need at least 3 points for bbox scaling")
     
-    # Compute percentile bounds (e.g., for 95%: use 2.5% and 97.5%)
-    lower_percentile = (100.0 - percentile) / 2.0
-    upper_percentile = 100.0 - lower_percentile
+    # Compute percentile bounds (e.g., for 95%: use 5% and 95%)
+    percentile_low = (100.0 - percentile) / 2.0
+    percentile_high = 100.0 - percentile_low
     
-    # Compute bbox for Gaussian points
-    gaussian_min = np.percentile(gaussian_points, lower_percentile, axis=0)  # (3,)
-    gaussian_max = np.percentile(gaussian_points, upper_percentile, axis=0)  # (3,)
+    # Filter outliers from both point clouds
+    gaussian_filtered = filter_points_by_percentile(
+        gaussian_points,
+        percentile_low,
+        percentile_high,
+    )
+    
+    point_cloud_filtered = filter_points_by_percentile(
+        point_cloud_points,
+        percentile_low,
+        percentile_high,
+    )
+    
+    # Check we still have enough points after filtering
+    if gaussian_filtered.shape[0] < 3 or point_cloud_filtered.shape[0] < 3:
+        raise ValueError(
+            f"Not enough points after filtering: "
+            f"gaussian={gaussian_filtered.shape[0]}, "
+            f"point_cloud={point_cloud_filtered.shape[0]}"
+        )
+    
+    # Compute bounding boxes on filtered points
+    gaussian_min = gaussian_filtered.min(axis=0)  # (3,)
+    gaussian_max = gaussian_filtered.max(axis=0)  # (3,)
     gaussian_size = gaussian_max - gaussian_min  # (3,)
     gaussian_diagonal = np.linalg.norm(gaussian_size)  # scalar
     
-    # Compute bbox for point cloud points
-    pc_min = np.percentile(point_cloud_points, lower_percentile, axis=0)  # (3,)
-    pc_max = np.percentile(point_cloud_points, upper_percentile, axis=0)  # (3,)
+    pc_min = point_cloud_filtered.min(axis=0)  # (3,)
+    pc_max = point_cloud_filtered.max(axis=0)  # (3,)
     pc_size = pc_max - pc_min  # (3,)
     pc_diagonal = np.linalg.norm(pc_size)  # scalar
     
@@ -515,15 +523,6 @@ def align_gaussians(
             random_state=kwargs.get("random_state", 42),
         )
     
-    elif method == GaussianScalingMethod.UMEYAMA_CAMERAS:
-        return umeyama_cameras(
-            extrinsics,
-            gaussian_points,
-            ransac=kwargs.get("ransac", True),
-            ransac_max_iters=kwargs.get("ransac_max_iters", 50),
-            random_state=kwargs.get("random_state", 42),
-        )
-    
     elif method == GaussianScalingMethod.MEDIAN_DISTANCE:
         scale = median_distance_scaling(extrinsics)
         # Return identity rotation and zero translation, only scale
@@ -581,9 +580,12 @@ def align_gaussians_to_point_cloud(
         method = GaussianScalingMethod(method)
     
     # Convert tensors to numpy if needed
-    gaussian_points = prediction.gaussians.means  # (N, 3)
+    gaussian_points = prediction.gaussians.means  # (B, N, 3) or (N, 3)
     if isinstance(gaussian_points, torch.Tensor):
         gaussian_points = gaussian_points.detach().cpu().numpy()
+    
+    # Reshape to handle batch dimensions
+    gaussian_points_2d, gaussian_original_shape = _reshape_points_to_2d(gaussian_points)
     
     # Ensure extrinsics are numpy arrays
     extrinsics_np = prediction.extrinsics
@@ -601,23 +603,23 @@ def align_gaussians_to_point_cloud(
                 max_samples=max_samples,
             )
             
-            if point_cloud_points.shape[0] < 3 or gaussian_points.shape[0] < 3:
-                logger.warning("Not enough points for alignment. Skipping.")
+            if point_cloud_points.shape[0] < 3 or gaussian_points_2d.shape[0] < 3:
+                logger.warn("Not enough points for alignment. Skipping.")
                 return prediction
             
             # Sample a subset for faster alignment if we have too many points
-            n_samples = min(n_samples_for_alignment, point_cloud_points.shape[0], gaussian_points.shape[0])
+            n_samples = min(n_samples_for_alignment, point_cloud_points.shape[0], gaussian_points_2d.shape[0])
             if point_cloud_points.shape[0] > n_samples:
                 idx = np.random.choice(point_cloud_points.shape[0], n_samples, replace=False)
                 point_cloud_samples = point_cloud_points[idx]
             else:
                 point_cloud_samples = point_cloud_points
             
-            if gaussian_points.shape[0] > n_samples:
-                idx = np.random.choice(gaussian_points.shape[0], n_samples, replace=False)
-                gaussian_samples = gaussian_points[idx]
+            if gaussian_points_2d.shape[0] > n_samples:
+                idx = np.random.choice(gaussian_points_2d.shape[0], n_samples, replace=False)
+                gaussian_samples = gaussian_points_2d[idx]
             else:
-                gaussian_samples = gaussian_points
+                gaussian_samples = gaussian_points_2d
             
             rot, trans, scale = align_gaussians(
                 method=method,
@@ -629,27 +631,17 @@ def align_gaussians_to_point_cloud(
                 random_state=random_state,
             )
         
-        elif method == GaussianScalingMethod.UMEYAMA_CAMERAS:
-            rot, trans, scale = align_gaussians(
-                method=method,
-                gaussian_points=gaussian_points,
-                extrinsics=extrinsics_np,
-                ransac=ransac,
-                ransac_max_iters=ransac_max_iters,
-                random_state=random_state,
-            )
-        
         elif method == GaussianScalingMethod.MEDIAN_DISTANCE:
             rot, trans, scale = align_gaussians(
                 method=method,
-                gaussian_points=gaussian_points,
+                gaussian_points=gaussian_points_2d,
                 extrinsics=extrinsics_np,
             )
         
         elif method == GaussianScalingMethod.INVERSE_NORMALIZATION:
             rot, trans, scale = align_gaussians(
                 method=method,
-                gaussian_points=gaussian_points,
+                gaussian_points=gaussian_points_2d,
                 extrinsics=extrinsics_np,
             )
         
@@ -663,13 +655,13 @@ def align_gaussians_to_point_cloud(
                 max_samples=10000,
             )
             
-            if point_cloud_points.shape[0] < 3 or gaussian_points.shape[0] < 3:
-                logger.warning("Not enough points for bbox scaling. Skipping.")
+            if point_cloud_points.shape[0] < 3 or gaussian_points_2d.shape[0] < 3:
+                logger.warn("Not enough points for bbox scaling. Skipping.")
                 return prediction
             
             rot, trans, scale = align_gaussians(
                 method=method,
-                gaussian_points=gaussian_points,
+                gaussian_points=gaussian_points_2d,
                 extrinsics=extrinsics_np,
                 point_cloud_points=point_cloud_points,
                 percentile=95.0,  # Hardcoded for now
@@ -678,11 +670,13 @@ def align_gaussians_to_point_cloud(
         else:
             raise ValueError(f"Unknown scaling method: {method}")
         
-        # Apply transformation to all Gaussian points
-        # Convert back to tensor if original was tensor
-        gaussian_means_np = transform_points_sim3(
-            gaussian_points, rot, trans, scale, inverse=False
+        # Apply transformation to all Gaussian points (using 2D reshaped version)
+        gaussian_means_np_2d = transform_points_sim3(
+            gaussian_points_2d, rot, trans, scale, inverse=False
         )
+        
+        # Reshape back to original shape
+        gaussian_means_np = _reshape_points_back(gaussian_means_np_2d, gaussian_original_shape)
         
         # Convert back to tensor if original was tensor
         if isinstance(prediction.gaussians.means, torch.Tensor):
@@ -693,7 +687,12 @@ def align_gaussians_to_point_cloud(
             prediction.gaussians.means = gaussian_means_np
         
         # Also scale the Gaussian scales
-        prediction.gaussians.scales = prediction.gaussians.scales * scale
+        # Convert scale to appropriate type (torch.Tensor if scales is tensor, else numpy)
+        if isinstance(prediction.gaussians.scales, torch.Tensor):
+            scale_tensor = torch.tensor(scale, dtype=prediction.gaussians.scales.dtype, device=prediction.gaussians.scales.device)
+            prediction.gaussians.scales = prediction.gaussians.scales * scale_tensor
+        else:
+            prediction.gaussians.scales = prediction.gaussians.scales * scale
         
         logger.info(
             f"Aligned Gaussians using {method.value}: "
