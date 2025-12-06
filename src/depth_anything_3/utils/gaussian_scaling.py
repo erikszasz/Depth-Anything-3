@@ -260,6 +260,10 @@ def filter_points_by_percentile(
     """
     Filter points by removing those outside the percentile range in each dimension.
     
+    Percentile thresholds are computed independently for each dimension on the
+    original unfiltered data, then points are filtered to keep only those within
+    all thresholds simultaneously.
+    
     Args:
         points: Point cloud (N, 3)
         percentile_low: Lower percentile threshold (e.g., 5.0)
@@ -268,19 +272,17 @@ def filter_points_by_percentile(
     Returns:
         Filtered points (M, 3) where M <= N
     """
-    filtered_points = points.copy()
+    # Compute percentile thresholds for each dimension on original data
+    thresholds_low = np.percentile(points, percentile_low, axis=0)  # (3,)
+    thresholds_high = np.percentile(points, percentile_high, axis=0)  # (3,)
     
-    for dim in range(3):  # x, y, z dimensions
-        # Use filtered_points (not original points) to get values for current dimension
-        values = filtered_points[:, dim]
-        low_threshold = np.percentile(values, percentile_low)
-        high_threshold = np.percentile(values, percentile_high)
-        
-        # Keep points within percentile range for this dimension
-        mask = (values >= low_threshold) & (values <= high_threshold)
-        filtered_points = filtered_points[mask]
+    # Filter points that are within all thresholds simultaneously
+    mask = np.all(
+        (points >= thresholds_low[None, :]) & (points <= thresholds_high[None, :]),
+        axis=1,
+    )
     
-    return filtered_points
+    return points[mask]
 
 
 def bbox_scaling(
