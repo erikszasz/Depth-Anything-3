@@ -410,6 +410,12 @@ class NestedDepthAnything3Net(nn.Module):
         # Apply scaling to depth and extrinsics
         output.depth *= scale_factor
         output.extrinsics[:, :, :3, 3] *= scale_factor
+        
+        if output.get("gaussians") is not None:
+            gaussians = output.gaussians
+            gaussians.means = gaussians.means * scale_factor
+            gaussians.scales = gaussians.scales * scale_factor
+            
         output.is_metric = 1
         output.scale_factor = scale_factor.item()
 
